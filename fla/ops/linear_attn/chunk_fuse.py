@@ -32,16 +32,24 @@ def fused_chunk_linear_attn_fwd_kernel(
     o,  # output [B, H, L, D_head_V]
     initial_state,  # initial state of the chunk [B, H, D_head_K, D_head_V]
     final_state,  # final state of the chunk [B, H, D_head_K, D_head_V]
+
+    # Stride parameters (s_qk_h, s_qk_t, s_qk_d, etc.) 
+    # are used to determine how to step through the tensors in memory, 
+    # ensuring that each block accesses the correct data.
     s_qk_h,  # stride size: L * D_head_K
     s_qk_t,  # stride size: D_head_K
     s_qk_d,  # stride size: 1
     s_vo_h,  # stride size: L * D_head_V
     s_vo_t,  # stride size: D_head_V
     s_vo_d,  # stride size: 1
+    
     B,  # batch size
     H,  # n_heads
     T,  # seq_len
     scale,  # D_head_K ** -0.5
+
+    # tl.constexpr informs the compiler that a parameter's value is constant and known at compile-time. 
+    # This allows the compiler to make optimizations that wouldn't be possible if the value were to change at runtime.
     BT: tl.constexpr,  # BLOCK SIZE along the sequence dimension, a.k.a. chunk size
     BK: tl.constexpr,  # BLOCK SIZE along the K dimension
     BV: tl.constexpr,  # BLOCK SIZE along the V dimension
@@ -49,28 +57,54 @@ def fused_chunk_linear_attn_fwd_kernel(
     DV: tl.constexpr,  # D_head_V
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    CHECK: tl.constexpr
+    CHECK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     # indices
+    # # Kernel program IDs, each dimension gets its unique ID to handle different parts of data.
     i_v, i_k, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # defines three variables, i_v, i_k, and i_bh, 
+    # each assigned to a specific program identifier returned by tl.program_id(axis). 
+    # This function is used to retrieve the unique identifier (ID) of 
+    # the currently executing instance of a kernel program on a specified dimension of the execution grid.
 
+    # Array of sequence indices for the current block, used in operations below.
     o_i = tl.arange(0, BT)
 
+    #################################
+    ###### VERY IMPORTANT HERE ######
+    #################################
+    # Generate a mask for the self-attention to ensure causality in sequences.
     # [BT, BT]
-    m_s = o_i[:, None] >= o_i[None, :]
+    if IS_CAUSAL:
+        m_s = o_i[:, None] >= o_i[None, :]
+    else:
+        # Conditional mask based on is_causal flag
+        # `tl.where(condition, x, y): `
+        # This function returns elements chosen from x or y based on the condition. 
+        # If the condition at a certain index is True, it selects the corresponding element from x at that index; 
+        # otherwise, it selects from y.
+        m_s = tl.ones((BT, BT), dtype=bool)
+    #################################
+
+    # Initialize a block tensor for intermediate storage of results.
     # [BK, BV]
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
 
+    # Create block pointers to efficiently handle sections of the input tensors based on program IDs and strides.
     # make block pointers
     p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (T, DK), (s_qk_t, s_qk_d), (0, i_k * BK), (BT, BK), (1, 0))
     p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (DK, T), (s_qk_d, s_qk_t), (i_k * BK, 0), (BK, BT), (0, 1))
     p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, DV), (s_vo_t, s_vo_d), (0, i_v * BV), (BT, BV), (1, 0))
     p_o = tl.make_block_ptr(o + (i_bh+i_k*B*H) * s_vo_h, (T, DV), (s_vo_t, s_vo_d), (0, i_v * BV), (BT, BV), (1, 0))
 
+    # If using an initial state, load it into the block tensor b_h.
     if USE_INITIAL_STATE:
         p_h = tl.make_block_ptr(initial_state + i_bh * DK * DV, (DK, DV), (DV, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
         b_h = tl.load(p_h, boundary_check=(0, 1)).to(tl.float32)
 
+    # Main loop over chunks of the sequence
+    # compute via each chunk, and finally concatenate them together 
     for i in range(0, tl.cdiv(T, BT)):
         # [BK, BT]
         b_k = tl.load(p_k, boundary_check=(0, 1))
@@ -80,6 +114,7 @@ def fused_chunk_linear_attn_fwd_kernel(
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_k.dtype)
 
+        # Compute scaled dot products, apply mask, and perform matrix multiplication for attention output
         # [BT, BT]
         b_s = tl.dot(b_q, b_k, allow_tf32=False)
         b_s = tl.where(m_s, b_s, 0)
@@ -92,11 +127,13 @@ def fused_chunk_linear_attn_fwd_kernel(
             b_o += tl.dot(b_q, b_h.to(b_q.dtype), allow_tf32=False)
             b_h = b_h + tl.dot(b_k, b_v, allow_tf32=False)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        # Advance pointers for the next chunk
         p_q = tl.advance(p_q, (BT, 0))
         p_k = tl.advance(p_k, (0, BT))
         p_v = tl.advance(p_v, (BT, 0))
         p_o = tl.advance(p_o, (BT, 0))
 
+    # Store the final state if required
     if STORE_FINAL_STATE:
         p_final = tl.make_block_ptr(final_state + i_bh * DK * DV, (DK, DV), (DV, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
         tl.store(p_final, b_h.to(p_final.dtype.element_ty), boundary_check=(0, 1))
@@ -133,12 +170,16 @@ def fused_chunk_linear_attn_bwd_kernel(
     DK: tl.constexpr,  # D_head_K
     DV: tl.constexpr,  # D_head_V
     USE_INITIAL_STATE: tl.constexpr,
-    CHECK: tl.constexpr
+    CHECK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     i_v, i_k, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     o_i = tl.arange(0, BT)
 
-    m_s = o_i[:, None] >= o_i[None, :]
+    if IS_CAUSAL:
+        m_s = o_i[:, None] >= o_i[None, :]
+    else:
+        m_s = tl.ones((BT, BT), dtype = bool)
     # [BV, BK]
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -223,15 +264,29 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
     @staticmethod
     @contiguous
     @custom_fwd
-    def forward(ctx, q, k, v, scale, initial_state, output_final_state):
+    def forward(
+        ctx, 
+        q, 
+        k, 
+        v, 
+        scale, 
+        initial_state, 
+        output_final_state,
+        is_causal,
+    ):
+        ctx.is_causal = is_causal
+
         batch_size, n_heads, seq_len, d_head_qk = q.shape
         d_head_v = v.shape[-1]
         ctx.scale = scale
-        BT = 64
+        BT = 64 # block size for triton operations, used for kernel launch configuration
         BK, BV = min(triton.next_power_of_2(d_head_qk), 64), min(triton.next_power_of_2(d_head_v), 64)
         NK, NV = triton.cdiv(d_head_qk, BK), triton.cdiv(d_head_v, BV)
         num_stages = 1
         num_warps = 4
+
+        # this method creates a new tensor with the same data type and device as `q`
+        # create a new tensor `o` with uninitialized data        
         o = q.new_empty(NK, batch_size, n_heads, seq_len, d_head_v)
         if output_final_state:
             final_state = q.new_empty(batch_size, n_heads, d_head_qk, d_head_v, dtype=torch.float32, requires_grad=False)
@@ -251,7 +306,10 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
             )
             CHECK = True
 
+        # the attention mechanism computation is being performed in parallel across batches and heads.
         grid = (NV, NK, batch_size * n_heads)
+        # perform parallel attention computation within each block
+        # output is stored to `o`
         fused_chunk_linear_attn_fwd_kernel[grid](
             q, k, v, o, initial_state, final_state,
             q.stride(1), q.stride(2), q.stride(3),
@@ -262,7 +320,8 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
             STORE_FINAL_STATE=output_final_state,
             CHECK=CHECK,
             num_warps=num_warps,
-            num_stages=num_stages
+            num_stages=num_stages,
+            IS_CAUSAL=is_causal,
         )
 
         o = o.sum(0)
@@ -273,7 +332,12 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     @contiguous
-    def backward(ctx, do, d_final_state=None):
+    def backward(
+        ctx, 
+        do, 
+        d_final_state=None,
+    ):
+        is_causal = ctx.is_causal
         q, k, v, initial_state = ctx.saved_tensors
         batch_size, n_heads, seq_len, d_head_qk = q.shape
         d_head_v = v.shape[-1]
@@ -299,7 +363,8 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
             USE_INITIAL_STATE=initial_state is not None,
             CHECK=ctx.CHECK,
             num_warps=num_warps,
-            num_stages=num_stages
+            num_stages=num_stages,
+            IS_CAUSAL=is_causal,
         )
         dq = dq.sum(0)
         dk = dk.sum(0)
@@ -314,13 +379,30 @@ def fused_chunk_linear_attn(
     scale: float = -1,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
-    normalize: bool = True
+    normalize: bool = True,
+    is_causal: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if initial_state is not None:
         initial_state = initial_state.detach()
     if scale == -1:
         scale = q.shape[-1] ** -0.5
-    o, final_state = FusedChunkLinearAttentionFunction.apply(q, k, v, scale, initial_state, output_final_state)
+
+    # When you call FusedChunkLinearAttentionFunction.apply with the necessary inputs in PyTorch, 
+    # you are specifically triggering the execution of the forward method defined within the FusedChunkLinearAttentionFunction class.
+    # 
+    # Difference between calling FusedChunkLinearAttentionFunction.forward() and FusedChunkLinearAttentionFunction.apply()
+    # 
+    # Autograd Integration: 
+    # When you call apply() on an instance of torch.autograd.Function, you are using a class method that is specifically designed to handle both forward and backward passes correctly with PyTorch's autograd system. This method not only executes the forward() method but also sets up the necessary state and hooks to ensure that the gradients can be properly computed during the backward pass.
+    # 
+    # Gradient Computation: 
+    # By using apply(), PyTorch records all operations performed in forward() on tensors that require gradients. This recording is essential for the autograd engine to later backtrack through these operations to compute gradients when .backward() is invoked on the loss tensor.
+    # 
+    # Usage: 
+    # It is used when you need to ensure that your custom operation integrates seamlessly with PyTorch’s automatic differentiation.
+    # 
+    o, final_state = FusedChunkLinearAttentionFunction.apply(
+        q, k, v, scale, initial_state, output_final_state, is_causal)
     if normalize:
         o = normalize_output(q * scale, k, o)
     return o, final_state
